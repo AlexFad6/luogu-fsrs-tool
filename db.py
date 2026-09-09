@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from tag_manager import TagManager
 
 
 ROOT = Path(__file__).resolve().parent
@@ -32,8 +33,13 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             title TEXT NOT NULL,
             difficulty TEXT,
             tags TEXT,
+            algorithm_tags TEXT,
+            technical_tags TEXT,
+            all_tags TEXT,
             is_solved INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            source_url TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS review_records (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,6 +49,21 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             duration INTEGER,
             note TEXT
         );
+        CREATE TABLE IF NOT EXISTS tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            category_l1 TEXT NOT NULL,
+            category_l2 TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS problem_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pid TEXT NOT NULL REFERENCES problems(pid) ON DELETE CASCADE,
+            tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+            UNIQUE(pid, tag_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_problem_tags_pid ON problem_tags(pid);
+        CREATE INDEX IF NOT EXISTS idx_problem_tags_tag_id ON problem_tags(tag_id);
         CREATE TABLE IF NOT EXISTS card_states (
             pid TEXT PRIMARY KEY REFERENCES problems(pid),
             stability REAL,
@@ -55,6 +76,33 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_review_pid ON review_records(pid);
         """
     )
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(problems)")}
+    for name, definition in (
+        ("algorithm_tags", "TEXT"), ("technical_tags", "TEXT"), ("all_tags", "TEXT"),
+        ("source_url", "TEXT"), ("updated_at", "TEXT"),
+    ):
+        if name not in columns:
+            connection.execute(f"ALTER TABLE problems ADD COLUMN {name} {definition}")
+    connection.execute(
+        "UPDATE problems SET all_tags = COALESCE(all_tags, tags, '[]'), "
+        "algorithm_tags = COALESCE(algorithm_tags, tags, '[]'), "
+        "technical_tags = COALESCE(technical_tags, '[]'), "
+        "updated_at = COALESCE(updated_at, created_at)"
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_algorithm_tags ON problems(algorithm_tags)")
+    manager = TagManager(connection)
+    manager.initialize()
+    for row in connection.execute("SELECT pid, all_tags, tags FROM problems"):
+        try:
+            names = json.loads(row["all_tags"] or row["tags"] or "[]")
+        except json.JSONDecodeError:
+            names = []
+        for name in names:
+            tag = manager.get_or_create_tag(str(name))
+            connection.execute(
+                "INSERT OR IGNORE INTO problem_tags(pid, tag_id) VALUES (?, ?)",
+                (row["pid"], tag.id),
+            )
     connection.commit()
 
 
@@ -77,16 +125,79 @@ def upsert_problem(connection: sqlite3.Connection, pid: str, title: str,
     encoded_tags = json.dumps(list(tags or []), ensure_ascii=False)
     connection.execute(
         """
-        INSERT INTO problems(pid, title, difficulty, tags, is_solved)
-        VALUES (?, ?, ?, ?, 1)
+        INSERT INTO problems(pid, title, difficulty, tags, algorithm_tags, technical_tags, all_tags, is_solved, updated_at)
+        VALUES (?, ?, ?, ?, ?, '[]', ?, 1, ?)
         ON CONFLICT(pid) DO UPDATE SET
             title = excluded.title,
             difficulty = COALESCE(excluded.difficulty, problems.difficulty),
             tags = CASE WHEN excluded.tags = '[]' THEN problems.tags ELSE excluded.tags END,
-            is_solved = 1
+            algorithm_tags = CASE WHEN excluded.tags = '[]' THEN problems.algorithm_tags ELSE excluded.algorithm_tags END,
+            all_tags = CASE WHEN excluded.tags = '[]' THEN problems.all_tags ELSE excluded.all_tags END,
+            is_solved = 1, updated_at = excluded.updated_at
         """,
-        (pid, title, difficulty, encoded_tags),
+        (pid, title, difficulty, encoded_tags, encoded_tags, encoded_tags, iso_now()),
     )
+
+
+def save_problem(connection: sqlite3.Connection, problem: dict) -> None:
+    """Save scraped metadata while preserving solved/review state."""
+    now = iso_now()
+    tags = problem.get("tags", [])
+    if tags and isinstance(tags[0], dict):
+        tag_names = [tag["name"] for tag in tags]
+    else:
+        tag_names = list(problem.get("all_tags", tags))
+    manager = TagManager(connection)
+    manager.initialize()
+    connection.execute(
+        """
+        INSERT INTO problems
+          (pid, title, difficulty, algorithm_tags, technical_tags, all_tags,
+           tags, source_url, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(pid) DO UPDATE SET
+          title=excluded.title, difficulty=excluded.difficulty,
+          algorithm_tags=excluded.algorithm_tags, technical_tags=excluded.technical_tags,
+          all_tags=excluded.all_tags, tags=excluded.all_tags,
+          source_url=excluded.source_url, updated_at=excluded.updated_at
+        """,
+        (problem["pid"], problem["title"], problem.get("difficulty"),
+         json.dumps(problem.get("algorithm_tags", []), ensure_ascii=False),
+         json.dumps(problem.get("technical_tags", []), ensure_ascii=False),
+         json.dumps(tag_names, ensure_ascii=False),
+         json.dumps(tag_names, ensure_ascii=False),
+         problem.get("source_url", ""), now),
+    )
+    connection.execute("DELETE FROM problem_tags WHERE pid = ?", (problem["pid"],))
+    for name in tag_names:
+        tag = manager.get_or_create_tag(str(name))
+        connection.execute(
+            "INSERT OR IGNORE INTO problem_tags(pid, tag_id) VALUES (?, ?)",
+            (problem["pid"], tag.id),
+        )
+    algorithm_names = manager.get_algorithm_tags(problem["pid"])
+    technical_names = [
+        row["name"] for row in connection.execute(
+            """SELECT t.name FROM problem_tags pt JOIN tags t ON t.id = pt.tag_id
+               WHERE pt.pid = ? AND t.category_l1 != '算法' ORDER BY t.name""",
+            (problem["pid"],),
+        )
+    ]
+    connection.execute(
+        "UPDATE problems SET algorithm_tags = ?, technical_tags = ? WHERE pid = ?",
+        (json.dumps(algorithm_names, ensure_ascii=False),
+         json.dumps(technical_names, ensure_ascii=False), problem["pid"]),
+    )
+
+
+def get_problem_with_tags(connection: sqlite3.Connection, pid: str) -> dict | None:
+    """Return a problem with all official category metadata."""
+    return TagManager(connection).get_problem_with_tags(pid)
+
+
+def get_problem_algorithm_tags(connection: sqlite3.Connection, pid: str) -> list[str]:
+    """Return only tags in the official ``算法`` category."""
+    return TagManager(connection).get_algorithm_tags(pid)
 
 
 def add_review(connection: sqlite3.Connection, pid: str, score: float,

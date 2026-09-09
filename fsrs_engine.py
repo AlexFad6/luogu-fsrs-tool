@@ -1,6 +1,6 @@
 """Adapter around the fsrs package."""
 
-from datetime import datetime, timezone
+from datetime import timezone
 from fsrs import Card, Rating, Scheduler, State
 
 
@@ -10,9 +10,8 @@ RATING_MAP = {0.0: Rating.Again, 0.3: Rating.Hard, 0.5: Rating.Good,
 
 def rating_for_score(score: float) -> Rating:
     """Map a user score to the closest supported FSRS rating."""
-    return min(RATING_MAP, key=lambda value: abs(value - score)) and RATING_MAP[
-        min(RATING_MAP, key=lambda value: abs(value - score))
-    ]
+    closest_score = min(RATING_MAP, key=lambda value: abs(value - score))
+    return RATING_MAP[closest_score]
 
 
 def state_from_card(card: Card, reps: int) -> dict:

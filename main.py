@@ -1,9 +1,9 @@
 """CLI entry point for the Luogu FSRS review tool."""
 
-import json
 import re
+import json
 import sqlite3
-from datetime import datetime, timezone
+import time
 
 import click
 from rich.console import Console
@@ -11,6 +11,8 @@ from rich.console import Console
 import db
 from fsrs_engine import initial_state, review_state
 from recommender import new_recommendations, statistics
+from crawler import LuoguCrawler
+from tag_manager import TagManager
 
 console = Console(legacy_windows=False)
 # Luogu identifiers use multiple prefixes (for example P, B, CF, and UVA).
@@ -49,7 +51,11 @@ def add(pid: str, title: str, difficulty: str | None, tags: str, score: float) -
     connection = setup()
     try:
         with connection:
-            db.upsert_problem(connection, pid, title, difficulty, [x.strip() for x in tags.split(",") if x.strip()])
+            db.save_problem(connection, {
+                "pid": pid, "title": title, "difficulty": difficulty,
+                "all_tags": [x.strip() for x in tags.split(",") if x.strip()],
+            })
+            connection.execute("UPDATE problems SET is_solved = 1 WHERE pid = ?", (pid,))
             db.add_review(connection, pid, score)
             db.save_card_state(connection, pid, initial_state(score))
         console.print(f"[green]已添加 {pid}，下次复习已安排。[/green]")
@@ -60,12 +66,101 @@ def add(pid: str, title: str, difficulty: str | None, tags: str, score: float) -
 
 
 @cli.command()
+@click.argument("pids", nargs=-1, required=True, callback=lambda ctx, param, values: tuple(
+    validate_pid(value) for value in values
+))
+@click.option("--delay", "-d", default=1.0, show_default=True, help="请求间隔秒数")
+@click.option("--force", is_flag=True, help="忽略本地数据，强制重新爬取并覆盖")
+def fetch(pids: tuple[str, ...], delay: float, force: bool) -> None:
+    """优先使用本地题目数据；使用 --force 强制重新爬取。"""
+    crawler = LuoguCrawler()
+    connection = setup()
+    try:
+        for index, pid in enumerate(pids):
+            try:
+                existing = db.get_problem_with_tags(connection, pid)
+                if existing is not None and not force:
+                    saved = existing
+                    console.print(f"[cyan]使用本地数据 {pid}: {saved['title']}[/cyan]")
+                else:
+                    result = crawler.fetch_problem(pid)
+                    with connection:
+                        db.save_problem(connection, result)
+                    saved = db.get_problem_with_tags(connection, result["pid"])
+                    console.print(f"[green]已爬取并覆盖 {result['pid']}: {result['title']}[/green]"
+                                  if existing is not None else
+                                  f"[green]已爬取 {result['pid']}: {result['title']}[/green]")
+                console.print(f"  难度: {saved['difficulty'] or '未设置'}")
+                for category, names in saved["tags_by_category"].items():
+                    console.print(f"  {category}: {', '.join(names)}")
+            except Exception as exc:
+                console.print(f"[red]爬取 {pid} 失败：{exc}[/red]", markup=False)
+            if index < len(pids) - 1:
+                time.sleep(delay)
+    finally:
+        connection.close()
+
+
+@cli.command()
+@click.argument("pid", callback=lambda ctx, param, value: validate_pid(value))
+def show(pid: str) -> None:
+    """显示题目、标签和复习状态。"""
+    connection = setup()
+    try:
+        problem = db.get_problem(connection, pid)
+        if problem is None:
+            raise click.ClickException(f"题目 {pid} 不存在，请先使用 fetch")
+        def tags(name: str, fallback: str = "[]") -> list[str]:
+            try:
+                return json.loads(problem[name] or fallback)
+            except json.JSONDecodeError:
+                return []
+        console.print(f"[题目] {pid} - {problem['title']}")
+        console.print(f"  难度: {problem['difficulty'] or '未设置'}")
+        detailed = db.get_problem_with_tags(connection, pid)
+        console.print("  标签分类:")
+        for category, names in detailed["tags_by_category"].items():
+            console.print(f"    {category}: {'、'.join(names)}")
+        state = connection.execute("SELECT * FROM card_states WHERE pid = ?", (pid,)).fetchone()
+        if state:
+            console.print("\n  复习状态:")
+            console.print(f"    下次复习: {state['due_date'] or '未安排'}")
+            console.print(f"    复习次数: {state['reps']}")
+            console.print(f"    稳定性: {state['stability'] or '未计算'}")
+    finally:
+        connection.close()
+
+
+@cli.command(name="tags")
+@click.option("--category", "-c", help="一级分类，例如 算法")
+@click.option("--subcategory", "-s", help="二级分类，例如 字符串")
+def browse_tags(category: str | None, subcategory: str | None) -> None:
+    """浏览洛谷标签分类字典。"""
+    connection = setup()
+    try:
+        manager = TagManager(connection)
+        if category:
+            rows = manager.get_tags_by_category(category, subcategory)
+            console.print(f"📂 {category}{f' / {subcategory}' if subcategory else ''}（{len(rows)} 个）")
+            for row in rows:
+                console.print(f"  {row.name}")
+        else:
+            console.print("📚 洛谷标签分类体系")
+            for l1, groups in manager.hierarchy.items():
+                console.print(f"\n{l1}")
+                for l2, names in groups.items():
+                    console.print(f"  【{l2}】（{len(names)} 个）")
+    finally:
+        connection.close()
+
+
+@cli.command()
 def today() -> None:
     """查看今日待复习题目。"""
     connection = setup()
     try:
         rows = db.due_problems(connection)
-        console.print(f"📋 今日待复习（{len(rows)} 题）：")
+        console.print(f"今日待复习（{len(rows)} 题）：")
         for index, row in enumerate(rows, 1):
             console.print(f"  {index}. {row['pid']} - {row['title']} [{row['difficulty'] or '未设置'}]")
     finally:
@@ -95,20 +190,23 @@ def review(pid: str, score: float) -> None:
 
 
 @cli.command()
-def recommend() -> None:
+@click.option("--count", "-c", default=5, show_default=True, help="推荐题目数量")
+def recommend(count: int) -> None:
     """推荐复习题和薄弱标签相关的新题。"""
     connection = setup()
     try:
         due = db.due_problems(connection)
-        due = due[:5]
-        new = new_recommendations(connection, 5 - len(due))
-        console.print(f"🎯 今日推荐（共 {len(due) + len(new)} 题）：")
+        due = due[:count]
+        new = new_recommendations(connection, count - len(due))
+        console.print(f"今日推荐（共 {len(due) + len(new)} 题）：")
         console.print(f"\n【复习 - {len(due)} 题】")
         for i, row in enumerate(due, 1):
             console.print(f"  {i}. {row['pid']} - {row['title']} [{row['difficulty'] or '未设置'}]")
         console.print(f"\n【新题 - {len(new)} 题】")
         for i, row in enumerate(new, len(due) + 1):
             console.print(f"  {i}. {row['pid']} - {row['title']} [{row['difficulty'] or '未设置'}]")
+        if new:
+            weak = ", ".join(tag for tag, _ in statistics(connection)["weak_tags"])
     finally:
         connection.close()
 
@@ -120,10 +218,10 @@ def stats() -> None:
     try:
         result = statistics(connection)
         weak = ", ".join(f"{tag} (错误率 {rate:.0%})" for tag, rate in result["weak_tags"]) or "无"
-        console.print("📊 学习统计：")
+        console.print("学习统计：")
         console.print(f"  总题数: {result['total']}\n  已复习: {result['reviewed']}")
         console.print(f"  正确率: {result['accuracy']:.0%}\n  薄弱标签: {weak}")
-        console.print(f"  连续打卡: {result['streak']} 天 🔥")
+        console.print(f"  连续打卡: {result['streak']} 天")
     finally:
         connection.close()
 
