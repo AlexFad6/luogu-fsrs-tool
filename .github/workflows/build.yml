@@ -35,7 +35,7 @@ jobs:
           pip install -r requirements.txt pyinstaller
 
       - name: Build with PyInstaller
-        run: pyinstaller --onefile --name luogu-fsrs-tool main.py
+        run: pyinstaller --onefile --name luogu-fsrs-tool --add-data "config.yaml${{ matrix.os == 'windows-latest' && ';' || ':' }}." main.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
