@@ -60,3 +60,13 @@ recommend:
   daily_count: 5
   weak_tag_threshold: 0.3
   min_practice_count: 2
+  min_samples_for_weakness: 5
+  weakness_weight: 1.0
+
+review_scoring:
+  floor_min: 5
+  imp_easy: 1.0
+  imp_good: 0.0
+  imp_hard: -1.0
+  wrong_hard: 2
+  wrong_again_margin: 1

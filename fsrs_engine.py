@@ -33,11 +33,16 @@ def initial_state(score: float) -> dict:
 
 
 def review_state(existing: dict, score: float) -> dict:
+    return review_state_by_rating(existing, rating_for_score(score))
+
+
+def review_state_by_rating(existing: dict, rating: Rating) -> dict:
+    """Update a card directly from an FSRS rating."""
     card = Card()
     for key in ("stability", "difficulty", "due", "last_review"):
         if key in existing and hasattr(card, key):
             setattr(card, key, existing[key])
     if existing.get("reps", 0) > 0:
         card.state = State.Review
-    updated = Scheduler().review_card(card, rating_for_score(score))[0]
+    updated = Scheduler().review_card(card, rating)[0]
     return state_from_card(updated, existing.get("reps", 0) + 1)

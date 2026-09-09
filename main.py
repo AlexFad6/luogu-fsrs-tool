@@ -4,15 +4,23 @@ import re
 import json
 import sqlite3
 import time
+import webbrowser
+from pathlib import Path
+from urllib.parse import urlparse
 
 import click
+import yaml
 from rich.console import Console
 
 import db
 from fsrs_engine import initial_state, review_state
+from fsrs_engine import review_state_by_rating
 from recommender import new_recommendations, statistics
 from crawler import LuoguCrawler
 from tag_manager import TagManager
+from review_scoring import infer_rating
+from tag_stats import weakness_stats
+from fsrs import Rating
 
 console = Console(legacy_windows=False)
 # Luogu identifiers use multiple prefixes (for example P, B, CF, and UVA).
@@ -35,9 +43,12 @@ def setup() -> sqlite3.Connection:
     return connection
 
 
-@click.group()
-def cli() -> None:
+@click.group(invoke_without_command=True)
+@click.pass_context
+def cli(context: click.Context) -> None:
     """基于 FSRS 的洛谷刷题复习工具。"""
+    if context.invoked_subcommand is None:
+        interactive_menu()
 
 
 @cli.command()
@@ -102,6 +113,32 @@ def fetch(pids: tuple[str, ...], delay: float, force: bool) -> None:
 
 
 @cli.command()
+@click.argument("url")
+@click.option("--force", is_flag=True, help="覆盖本地已有题目元数据")
+def training(url: str, force: bool) -> None:
+    """从洛谷题单页面批量导入题目，不逐题访问页面。"""
+    crawler = LuoguCrawler()
+    connection = setup()
+    try:
+        problems = crawler.fetch_training(url)
+        saved_count = 0
+        skipped_count = 0
+        with connection:
+            for problem in problems:
+                existing = db.get_problem(connection, problem["pid"])
+                if existing is not None and not force:
+                    skipped_count += 1
+                    continue
+                db.save_problem(connection, problem)
+                saved_count += 1
+        console.print(f"题单导入完成：共 {len(problems)} 题，新增/更新 {saved_count} 题，跳过 {skipped_count} 题。")
+    except Exception as exc:
+        raise click.ClickException(f"题单导入失败：{exc}") from exc
+    finally:
+        connection.close()
+
+
+@cli.command()
 @click.argument("pid", callback=lambda ctx, param, value: validate_pid(value))
 def show(pid: str) -> None:
     """显示题目、标签和复习状态。"""
@@ -141,11 +178,11 @@ def browse_tags(category: str | None, subcategory: str | None) -> None:
         manager = TagManager(connection)
         if category:
             rows = manager.get_tags_by_category(category, subcategory)
-            console.print(f"📂 {category}{f' / {subcategory}' if subcategory else ''}（{len(rows)} 个）")
+            console.print(f"{category}{f' / {subcategory}' if subcategory else ''}（{len(rows)} 个）")
             for row in rows:
                 console.print(f"  {row.name}")
         else:
-            console.print("📚 洛谷标签分类体系")
+            console.print("洛谷标签分类体系")
             for l1, groups in manager.hierarchy.items():
                 console.print(f"\n{l1}")
                 for l2, names in groups.items():
@@ -169,8 +206,13 @@ def today() -> None:
 
 @cli.command()
 @click.argument("pid", callback=lambda ctx, param, value: validate_pid(value))
-@click.option("--score", type=click.FloatRange(0, 1), required=True)
-def review(pid: str, score: float) -> None:
+@click.option("--score", type=click.FloatRange(0, 1))
+@click.option("--auto", "automatic", is_flag=True, help="根据历史用时和错误提交自动推断评分")
+@click.option("--duration", type=click.IntRange(0), help="本次用时（分钟）")
+@click.option("--wrong-submissions", type=click.IntRange(0), default=0, show_default=True)
+@click.option("--saw-solution", is_flag=True, help="本次复习前看过题解")
+def review(pid: str, score: float | None, automatic: bool, duration: int | None,
+           wrong_submissions: int, saw_solution: bool) -> None:
     """完成一次复习并安排下次复习。"""
     connection = setup()
     try:
@@ -180,9 +222,30 @@ def review(pid: str, score: float) -> None:
         existing = dict(row)
         existing["due"] = db.parse_datetime(existing.pop("due_date"))
         existing["last_review"] = db.parse_datetime(existing["last_review"])
+        history = [dict(item) for item in connection.execute(
+            "SELECT * FROM review_records WHERE pid = ? ORDER BY review_date, id", (pid,)
+        )]
+        if automatic and score is not None:
+            raise click.UsageError("--auto 不能与 --score 同时使用")
+        if score is None and not automatic:
+            raise click.UsageError("请提供 --score，或使用 --auto")
+        current = {"duration": duration, "wrong_submissions": wrong_submissions,
+                   "saw_solution": saw_solution}
+        if automatic:
+            rating, reason = infer_rating(history, current)
+            console.print(f"自动推断：{rating.name}（{reason}）")
+            if not click.confirm("确认使用该评分？", default=True):
+                console.print("已取消。")
+                return
+            score = {Rating.Again: 0.0, Rating.Hard: 0.3,
+                     Rating.Good: 0.5, Rating.Easy: 0.8}[rating]
+        else:
+            rating = None
         with connection:
-            db.add_review(connection, pid, score)
-            state = review_state(existing, score)
+            db.add_review(connection, pid, score, duration=duration,
+                          wrong_submissions=wrong_submissions,
+                          saw_solution=saw_solution)
+            state = review_state_by_rating(existing, rating) if rating else review_state(existing, score)
             db.save_card_state(connection, pid, state)
         console.print(f"已完成 {pid}，下次复习：{state['due_date']}")
     finally:
@@ -207,6 +270,13 @@ def recommend(count: int) -> None:
             console.print(f"  {i}. {row['pid']} - {row['title']} [{row['difficulty'] or '未设置'}]")
         if new:
             weak = ", ".join(tag for tag, _ in statistics(connection)["weak_tags"])
+            timing_weak = ", ".join(
+                f"{item['tag']}={item['weakness']:.2f}"
+                for item in weakness_stats(connection)
+                if item["weakness"] is not None and item["weakness"] > 0
+            )
+            if timing_weak:
+                console.print(f"  用时弱项: {timing_weak}")
     finally:
         connection.close()
 
@@ -221,9 +291,185 @@ def stats() -> None:
         console.print("学习统计：")
         console.print(f"  总题数: {result['total']}\n  已复习: {result['reviewed']}")
         console.print(f"  正确率: {result['accuracy']:.0%}\n  薄弱标签: {weak}")
+        console.print("  标签用时弱项:")
+        for item in weakness_stats(connection):
+            value = "数据不足" if item["weakness"] is None else f"{item['weakness']:.2f}"
+            console.print(f"    {item['tag']}: {value}（样本 {item['samples']}）")
         console.print(f"  连续打卡: {result['streak']} 天")
     finally:
         connection.close()
+
+
+def _menu_choice(title: str, options: list[str]) -> int:
+    """Display numbered options and return a zero-based selection."""
+    console.print(f"\n{title}")
+    for index, option in enumerate(options, 1):
+        console.print(f"  {index}. {option}")
+    console.print("  0. 退出")
+    return click.prompt("请输入选项编号", type=click.IntRange(0, len(options))) - 1
+
+
+def _difficulty_options() -> list[str]:
+    config_path = Path(__file__).with_name("config.yaml")
+    with config_path.open(encoding="utf-8") as stream:
+        return (yaml.safe_load(stream) or {}).get("difficulty", {}).get("levels", [])
+
+
+def _pid_from_input(value: str) -> tuple[str, str | None]:
+    value = value.strip()
+    if value.startswith(("http://", "https://")):
+        parts = [part for part in urlparse(value).path.split("/") if part]
+        if len(parts) >= 2 and parts[-2] == "problem":
+            return validate_pid(parts[-1]), value
+        raise click.BadParameter("网址必须是洛谷题目链接")
+    return validate_pid(value), None
+
+
+def _training_url(value: str) -> str | None:
+    """Return a canonical training URL when input identifies a problem set."""
+    value = value.strip()
+    if value.isdigit():
+        return f"https://www.luogu.com.cn/training/{value}"
+    if value.startswith(("http://", "https://")):
+        parsed = urlparse(value)
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 2 and parts[-2] == "training" and parts[-1].isdigit():
+            return value
+    return None
+
+
+def _import_luogu_problem() -> None:
+    """Import a training set or one problem, preferring training-set detection."""
+    value = click.prompt("输入题单链接、题单 ID、题目链接或题号")
+    training_url = _training_url(value)
+    force = click.confirm("是否覆盖本地已有题目？", default=False)
+    if training_url is not None:
+        training.callback(training_url, force)
+        return
+    if value.startswith(("http://", "https://")):
+        parts = [part for part in urlparse(value).path.split("/") if part]
+        if not (len(parts) >= 2 and parts[-2] == "problem"):
+            raise click.BadParameter("无法识别链接：请输入洛谷题单链接或题目链接")
+    pid, _ = _pid_from_input(value)
+    fetch.callback((pid,), 1.0, force)
+
+
+def _start_solving() -> None:
+    """Run a timed solving session and save it when the user reports AC."""
+    connection = setup()
+    try:
+        due = db.due_problems(connection)[:5]
+        new = new_recommendations(connection, max(0, 5 - len(due)))
+    finally:
+        connection.close()
+    candidates = due + new
+    console.print("\n每日推荐：")
+    if due:
+        console.print(f"  复习题（{len(due)} 题）")
+        for index, row in enumerate(due, 1):
+            console.print(f"    {index}. {row['pid']} - {row['title']}")
+    if new:
+        console.print(f"  新题（{len(new)} 题）")
+        for index, row in enumerate(new, len(due) + 1):
+            console.print(f"    {index}. {row['pid']} - {row['title']}")
+    if not candidates:
+        console.print("  当前没有推荐题目。")
+    value = click.prompt("输入推荐题目编号，或输入题号/题目链接")
+    link = None
+    if value.strip().isdigit():
+        index = int(value.strip())
+        if not 1 <= index <= len(candidates):
+            raise click.BadParameter("推荐题目编号超出范围")
+        pid = candidates[index - 1]["pid"]
+    else:
+        pid, link = _pid_from_input(value)
+    if link is None:
+        link = f"https://www.luogu.com.cn/problem/{pid}"
+        webbrowser.open(link)
+    console.print(f"开始做题：{pid}。输入 1 记录 AC，输入 2 记录 WA，输入 0 放弃本次记录。")
+    started = time.monotonic()
+    wrong_submissions = 0
+    while True:
+        result = click.prompt("本次结果")
+        if result == "0":
+            console.print("已退出，本次做题记录未保存。")
+            return
+        if result == "1":
+            break
+        wrong_submissions += 1
+        console.print(f"已记录 WA（累计 {wrong_submissions} 次）。")
+    duration = max(1, round((time.monotonic() - started) / 60))
+    connection = setup()
+    try:
+        with connection:
+            problem = db.get_problem(connection, pid)
+            if problem is None:
+                db.save_problem(connection, {"pid": pid, "title": pid, "all_tags": [],
+                                             "source_url": link})
+                connection.execute("UPDATE problems SET is_solved = 1 WHERE pid = ?", (pid,))
+                db.add_review(connection, pid, 0.5, duration=duration,
+                              wrong_submissions=wrong_submissions)
+                db.save_card_state(connection, pid, initial_state(0.5))
+                rating_text = "Good（新题）"
+            else:
+                card = connection.execute("SELECT * FROM card_states WHERE pid = ?", (pid,)).fetchone()
+                if card is None:
+                    db.add_review(connection, pid, 0.5, duration=duration,
+                                  wrong_submissions=wrong_submissions)
+                    db.save_card_state(connection, pid, initial_state(0.5))
+                    rating_text = "Good（自动创建卡片）"
+                else:
+                    history = [dict(row) for row in connection.execute(
+                        "SELECT * FROM review_records WHERE pid = ? ORDER BY review_date, id", (pid,)
+                    )]
+                    rating, reason = infer_rating(
+                        history, {"duration": duration, "wrong_submissions": wrong_submissions}
+                    )
+                    db.add_review(connection, pid, {
+                        Rating.Again: 0.0, Rating.Hard: 0.3,
+                        Rating.Good: 0.5, Rating.Easy: 0.8,
+                    }[rating], duration=duration, wrong_submissions=wrong_submissions)
+                    state = dict(card)
+                    state["due"] = db.parse_datetime(state.pop("due_date"))
+                    state["last_review"] = db.parse_datetime(state["last_review"])
+                    db.save_card_state(connection, pid, review_state_by_rating(state, rating))
+                    rating_text = f"{rating.name}（{reason}）"
+    finally:
+        connection.close()
+    console.print(f"AC，已记录用时 {duration} 分钟，评分：{rating_text}。")
+
+
+def interactive_menu() -> None:
+    """Run the numbered interactive interface used when no command is supplied."""
+    options = ["开始做题", "每日推荐", "导入洛谷题目",
+               "学习统计", "查看题目详情", "浏览标签库"]
+    while True:
+        choice = _menu_choice("洛谷 FSRS 复习工具", options)
+        try:
+            if choice == 0:
+                _start_solving()
+            elif choice == 1:
+                recommend.callback(5)
+            elif choice == 2:
+                _import_luogu_problem()
+            elif choice == 3:
+                stats.callback()
+            elif choice == 4:
+                pid = validate_pid(click.prompt("题号"))
+                show.callback(pid)
+            elif choice == 5:
+                category = click.prompt("一级分类（留空查看全部）", default="")
+                subcategory = ""
+                if category:
+                    subcategory = click.prompt("二级分类（留空查看该一级分类）", default="")
+                browse_tags.callback(category or None, subcategory or None)
+            elif choice == -1:
+                return
+        except (click.ClickException, click.BadParameter) as exc:
+            console.print(f"[red]{exc}[/red]")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n已退出。")
+            return
 
 
 if __name__ == "__main__":

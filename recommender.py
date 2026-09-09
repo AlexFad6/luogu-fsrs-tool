@@ -3,6 +3,7 @@
 import sqlite3
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
+from tag_stats import weakness_stats
 
 
 def weak_tags(connection: sqlite3.Connection) -> list[tuple[str, float]]:
@@ -23,7 +24,8 @@ def weak_tags(connection: sqlite3.Connection) -> list[tuple[str, float]]:
 
 
 def new_recommendations(connection: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
-    weak = [tag for tag, _ in weak_tags(connection)]
+    weak = [item["tag"] for item in weakness_stats(connection)
+            if item["weakness"] is not None and item["weakness"] > 0]
     if not weak:
         return list(connection.execute(
             "SELECT * FROM problems WHERE is_solved = 0 ORDER BY pid LIMIT ?", (limit,)

@@ -24,19 +24,25 @@ class LuoguCrawler:
     def _fetch_json(self, url: str) -> dict:
         return json.loads(self._fetch_html(url))
 
-    def _parse_problem_page(self, html: str) -> dict:
-        """Parse the ``lentille-context`` JSON embedded in a Luogu page."""
+    def _tag_names(self) -> dict[int, str]:
+        tag_data = self._fetch_json("https://www.luogu.com.cn/_lfe/tags/zh-CN")
+        return {item["id"]: item["name"] for item in tag_data.get("tags", [])}
+
+    @staticmethod
+    def _embedded_data(html: str) -> dict:
         match = re.search(
             r'<script[^>]*id=["\']lentille-context["\'][^>]*>(.*?)</script>',
             html, flags=re.IGNORECASE | re.DOTALL,
         )
-        if match:
-            payload = json.loads(unescape(match.group(1)))
-            problem = payload.get("data", {}).get("problem")
-            if isinstance(problem, dict):
-                tag_data = self._fetch_json("https://www.luogu.com.cn/_lfe/tags/zh-CN")
-                tag_names = {item["id"]: item["name"] for item in tag_data.get("tags", [])}
-                return self._normalize(problem, tag_names)
+        if not match:
+            raise ValueError("无法解析洛谷页面数据")
+        return json.loads(unescape(match.group(1))).get("data", {})
+
+    def _parse_problem_page(self, html: str) -> dict:
+        """Parse the ``lentille-context`` JSON embedded in a Luogu page."""
+        problem = self._embedded_data(html).get("problem")
+        if isinstance(problem, dict):
+            return self._normalize(problem, self._tag_names())
         raise ValueError("无法解析洛谷页面中的题目信息")
 
     @staticmethod
@@ -62,3 +68,21 @@ class LuoguCrawler:
         raw = self._parse_problem_page(self._fetch_html(url))
         return {**raw, "all_tags": raw["tags"], "tags": raw["tags"],
                 "source_url": url}
+
+    def fetch_training(self, url: str) -> list[dict]:
+        """Fetch every problem embedded in a training page in one request."""
+        data = self._embedded_data(self._fetch_html(url))
+        training = data.get("training")
+        if not isinstance(training, dict):
+            raise ValueError("网址不是有效的洛谷题单页面")
+        tag_names = self._tag_names()
+        source_url = url.split("#", 1)[0]
+        results = []
+        for problem in training.get("problems", []):
+            normalized = self._normalize(problem, tag_names)
+            results.append({
+                **normalized,
+                "all_tags": normalized["tags"],
+                "source_url": source_url,
+            })
+        return results
