@@ -1,0 +1,64 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"          # 打 v 开头的 tag 时自动构建并发布 Release
+  workflow_dispatch:  # 允许在 Actions 页面手动运行（只构建不上传 Release）
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: luogu-fsrs-tool-windows
+            binary: luogu-fsrs-tool.exe
+          - os: macos-latest
+            artifact_name: luogu-fsrs-tool-macos
+            binary: luogu-fsrs-tool
+          - os: ubuntu-latest
+            artifact_name: luogu-fsrs-tool-linux
+            binary: luogu-fsrs-tool
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller --onefile --name luogu-fsrs-tool main.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.binary }}
+
+  release:
+    needs: build          # 等三个平台的构建全部完成
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 允许创建 Release
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/luogu-fsrs-tool-windows/luogu-fsrs-tool.exe
+            dist/luogu-fsrs-tool-macos/luogu-fsrs-tool
+            dist/luogu-fsrs-tool-linux/luogu-fsrs-tool
