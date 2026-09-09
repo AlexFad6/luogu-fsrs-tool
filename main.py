@@ -22,7 +22,7 @@ from review_scoring import infer_rating
 from tag_stats import weakness_stats
 from fsrs import Rating
 
-console = Console(legacy_windows=False)
+console = Console()
 # Luogu identifiers use multiple prefixes (for example P, B, CF, and UVA).
 PID_RE = re.compile(r"^[A-Z][A-Z0-9_]*$", re.IGNORECASE)
 
