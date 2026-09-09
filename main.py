@@ -4,8 +4,10 @@ import re
 import json
 import sqlite3
 import time
+from pathlib import Path
 
 import click
+import yaml
 from rich.console import Console
 
 import db
@@ -35,9 +37,12 @@ def setup() -> sqlite3.Connection:
     return connection
 
 
-@click.group()
-def cli() -> None:
+@click.group(invoke_without_command=True)
+@click.pass_context
+def cli(context: click.Context) -> None:
     """基于 FSRS 的洛谷刷题复习工具。"""
+    if context.invoked_subcommand is None:
+        interactive_menu()
 
 
 @cli.command()
@@ -141,11 +146,11 @@ def browse_tags(category: str | None, subcategory: str | None) -> None:
         manager = TagManager(connection)
         if category:
             rows = manager.get_tags_by_category(category, subcategory)
-            console.print(f"📂 {category}{f' / {subcategory}' if subcategory else ''}（{len(rows)} 个）")
+            console.print(f"{category}{f' / {subcategory}' if subcategory else ''}（{len(rows)} 个）")
             for row in rows:
                 console.print(f"  {row.name}")
         else:
-            console.print("📚 洛谷标签分类体系")
+            console.print("洛谷标签分类体系")
             for l1, groups in manager.hierarchy.items():
                 console.print(f"\n{l1}")
                 for l2, names in groups.items():
@@ -224,6 +229,71 @@ def stats() -> None:
         console.print(f"  连续打卡: {result['streak']} 天")
     finally:
         connection.close()
+
+
+def _menu_choice(title: str, options: list[str]) -> int:
+    """Display numbered options and return a zero-based selection."""
+    console.print(f"\n{title}")
+    for index, option in enumerate(options, 1):
+        console.print(f"  {index}. {option}")
+    console.print("  0. 退出")
+    return click.prompt("请输入选项编号", type=click.IntRange(0, len(options))) - 1
+
+
+def _difficulty_options() -> list[str]:
+    config_path = Path(__file__).with_name("config.yaml")
+    with config_path.open(encoding="utf-8") as stream:
+        return (yaml.safe_load(stream) or {}).get("difficulty", {}).get("levels", [])
+
+
+def interactive_menu() -> None:
+    """Run the numbered interactive interface used when no command is supplied."""
+    options = ["添加做题记录", "爬取/读取题目", "查看今日待复习", "完成复习",
+               "每日推荐", "学习统计", "查看题目详情", "浏览标签库"]
+    while True:
+        choice = _menu_choice("洛谷 FSRS 复习工具", options)
+        try:
+            if choice == 0:
+                pid = validate_pid(click.prompt("题号"))
+                title = click.prompt("题目标题")
+                difficulty = click.prompt("题目难度", type=click.Choice(_difficulty_options()),
+                                          default=_difficulty_options()[0])
+                tags = click.prompt("标签（逗号分隔）", default="")
+                score = click.prompt("本次得分（0 / 0.3 / 0.5 / 0.8 / 1）",
+                                     type=click.FloatRange(0, 1))
+                add.callback(pid, title, difficulty, tags, score)
+            elif choice == 1:
+                pid = validate_pid(click.prompt("题号"))
+                force = click.confirm("是否强制重新爬取并覆盖本地数据？", default=False)
+                fetch.callback((pid,), 1.0, force)
+            elif choice == 2:
+                today.callback()
+            elif choice == 3:
+                pid = validate_pid(click.prompt("题号"))
+                score = click.prompt("复习得分（0 / 0.3 / 0.5 / 0.8 / 1）",
+                                     type=click.FloatRange(0, 1))
+                review.callback(pid, score)
+            elif choice == 4:
+                count = click.prompt("推荐题目数量", type=click.IntRange(1), default=5)
+                recommend.callback(count)
+            elif choice == 5:
+                stats.callback()
+            elif choice == 6:
+                pid = validate_pid(click.prompt("题号"))
+                show.callback(pid)
+            elif choice == 7:
+                category = click.prompt("一级分类（留空查看全部）", default="")
+                subcategory = ""
+                if category:
+                    subcategory = click.prompt("二级分类（留空查看该一级分类）", default="")
+                browse_tags.callback(category or None, subcategory or None)
+            elif choice == -1:
+                return
+        except (click.ClickException, click.BadParameter) as exc:
+            console.print(f"[red]{exc}[/red]")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n已退出。")
+            return
 
 
 if __name__ == "__main__":

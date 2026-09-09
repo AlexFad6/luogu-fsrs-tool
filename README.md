@@ -10,6 +10,14 @@ python -m pip install -r requirements.txt
 
 ## 使用
 
+直接运行会进入数字选择菜单：
+
+```bash
+python main.py
+```
+
+菜单会依次列出添加记录、爬取题目、复习、推荐、统计等功能，输入 `0` 退出；命令行子命令仍保留用于脚本调用。
+
 ```bash
 python main.py add P1001 --title "A+B Problem" --difficulty "入门" --tags "模拟" --score 1
 python main.py today
