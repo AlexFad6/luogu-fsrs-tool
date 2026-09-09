@@ -47,7 +47,10 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             review_date TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             score REAL NOT NULL CHECK(score >= 0 AND score <= 1),
             duration INTEGER,
-            note TEXT
+            note TEXT,
+            wrong_submissions INTEGER NOT NULL DEFAULT 0,
+            saw_solution INTEGER NOT NULL DEFAULT 0,
+            primary_tag TEXT
         );
         CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +93,14 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         "updated_at = COALESCE(updated_at, created_at)"
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_algorithm_tags ON problems(algorithm_tags)")
+    review_columns = {row["name"] for row in connection.execute("PRAGMA table_info(review_records)")}
+    for name, definition in (
+        ("wrong_submissions", "INTEGER NOT NULL DEFAULT 0"),
+        ("saw_solution", "INTEGER NOT NULL DEFAULT 0"),
+        ("primary_tag", "TEXT"),
+    ):
+        if name not in review_columns:
+            connection.execute(f"ALTER TABLE review_records ADD COLUMN {name} {definition}")
     manager = TagManager(connection)
     manager.initialize()
     for row in connection.execute("SELECT pid, all_tags, tags FROM problems"):
@@ -103,7 +114,19 @@ def initialize_database(connection: sqlite3.Connection) -> None:
                 "INSERT OR IGNORE INTO problem_tags(pid, tag_id) VALUES (?, ?)",
                 (row["pid"], tag.id),
             )
+    _backfill_primary_tags(connection)
     connection.commit()
+
+
+def _backfill_primary_tags(connection: sqlite3.Connection) -> None:
+    """Backfill primary tags using the least-practiced algorithm tag."""
+    rows = connection.execute(
+        "SELECT id, pid FROM review_records WHERE primary_tag IS NULL ORDER BY review_date, id"
+    ).fetchall()
+    for row in rows:
+        tag = primary_tag(connection, row["pid"])
+        connection.execute("UPDATE review_records SET primary_tag = ? WHERE id = ?",
+                           (tag, row["id"]))
 
 
 def iso_now() -> str:
@@ -201,11 +224,26 @@ def get_problem_algorithm_tags(connection: sqlite3.Connection, pid: str) -> list
 
 
 def add_review(connection: sqlite3.Connection, pid: str, score: float,
-               duration: int | None = None, note: str | None = None) -> None:
+               duration: int | None = None, note: str | None = None,
+               wrong_submissions: int = 0, saw_solution: bool = False) -> None:
+    tag = primary_tag(connection, pid)
     connection.execute(
-        "INSERT INTO review_records(pid, score, duration, note) VALUES (?, ?, ?, ?)",
-        (pid, score, duration, note),
+        """INSERT INTO review_records
+           (pid, score, duration, note, wrong_submissions, saw_solution, primary_tag)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (pid, score, duration, note, wrong_submissions, int(saw_solution), tag),
     )
+
+
+def primary_tag(connection: sqlite3.Connection, pid: str) -> str | None:
+    rows = connection.execute(
+        """SELECT t.name, COUNT(r.id) AS practice_count
+           FROM problem_tags pt JOIN tags t ON t.id = pt.tag_id
+           LEFT JOIN review_records r ON r.pid = pt.pid AND r.primary_tag = t.name
+           WHERE pt.pid = ? AND t.category_l1 = '算法'
+           GROUP BY t.id ORDER BY practice_count, t.id""", (pid,)
+    ).fetchall()
+    return rows[0]["name"] if rows else None
 
 
 def save_card_state(connection: sqlite3.Connection, pid: str, state: dict[str, Any]) -> None:
