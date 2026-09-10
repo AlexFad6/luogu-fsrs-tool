@@ -52,3 +52,10 @@ python main.py show P1001
 
 复习记录支持用时、错误提交次数和是否看过题解。`--auto` 会根据同题历史用时衰减
 推断 FSRS 评分；显式传入 `--score` 时始终以手动评分为准。
+
+## 鸣谢
+
+本项目基于以下优秀的开源项目构建：
+
+- [py-fsrs](https://github.com/open-spaced-repetition/py-fsrs) ——  间隔重复调度算法（FSRS） 的 Python 实现，本项目的核心复习引擎。感谢 [open-spaced-repetition](https://github.com/open-spaced-repetition) 社区的出色工作。
+- [洛谷](https://www.luogu.com.cn/) —— 题目数据来源。
