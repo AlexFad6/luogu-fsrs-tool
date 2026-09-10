@@ -338,6 +338,34 @@ def _training_url(value: str) -> str | None:
     return None
 
 
+def _problem_needs_metadata(problem: sqlite3.Row | None, pid: str) -> bool:
+    """Identify placeholder problems created before metadata was available."""
+    if problem is None or problem["title"] != pid:
+        return problem is None
+    try:
+        tags = json.loads(problem["all_tags"] or "[]")
+    except (TypeError, ValueError):
+        tags = []
+    return not problem["difficulty"] and not tags
+
+
+def _save_problem_for_ac(connection: sqlite3.Connection, pid: str, link: str,
+                         problem: sqlite3.Row | None) -> sqlite3.Row | None:
+    """Ensure an AC result has a persisted problem before creating its card."""
+    if not _problem_needs_metadata(problem, pid):
+        return problem
+    try:
+        fetched = LuoguCrawler().fetch_problem(pid)
+        fetched["source_url"] = link
+        db.save_problem(connection, fetched)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        console.print(f"获取题目 {pid} 元数据失败，将使用占位信息：{exc}", markup=False)
+        if problem is None:
+            db.save_problem(connection, {"pid": pid, "title": pid, "all_tags": [],
+                                         "source_url": link})
+    return db.get_problem(connection, pid)
+
+
 def _import_luogu_problem() -> None:
     """Import a training set or one problem, preferring training-set detection."""
     value = click.prompt("输入题单链接、题单 ID、题目链接或题号")
@@ -403,10 +431,11 @@ def _start_solving() -> None:
     try:
         with connection:
             problem = db.get_problem(connection, pid)
+            problem = _save_problem_for_ac(connection, pid, link, problem)
             if problem is None:
-                db.save_problem(connection, {"pid": pid, "title": pid, "all_tags": [],
-                                             "source_url": link})
-                connection.execute("UPDATE problems SET is_solved = 1 WHERE pid = ?", (pid,))
+                raise click.ClickException(f"无法保存题目 {pid}")
+            connection.execute("UPDATE problems SET is_solved = 1 WHERE pid = ?", (pid,))
+            if problem["title"] == pid and not problem["difficulty"]:
                 db.add_review(connection, pid, 0.5, duration=duration,
                               wrong_submissions=wrong_submissions)
                 db.save_card_state(connection, pid, initial_state(0.5))
