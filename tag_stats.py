@@ -5,18 +5,12 @@ from __future__ import annotations
 import math
 import sqlite3
 from statistics import median
-from pathlib import Path
-import yaml
+from review_scoring import configured_floor
 
 
 def _config() -> dict:
     with Path(__file__).with_name("config.yaml").open(encoding="utf-8") as stream:
         return (yaml.safe_load(stream) or {}).get("recommend", {})
-
-
-def _floor_min() -> int:
-    with Path(__file__).with_name("config.yaml").open(encoding="utf-8") as stream:
-        return (yaml.safe_load(stream) or {}).get("review_scoring", {}).get("floor_min", 5)
 
 
 def weakness_stats(connection: sqlite3.Connection) -> list[dict]:
@@ -27,13 +21,15 @@ def weakness_stats(connection: sqlite3.Connection) -> list[dict]:
     ).fetchall()
     by_difficulty: dict[str, list[float]] = {}
     for row in rows:
-        by_difficulty.setdefault(row["difficulty"], []).append(max(row["duration"], _floor_min()))
+        floor = configured_floor(row["difficulty"])
+        by_difficulty.setdefault(row["difficulty"], []).append(max(row["duration"], floor))
     baselines = {key: median(values) for key, values in by_difficulty.items() if len(values) >= 3}
     residuals: dict[str, list[float]] = {}
     for row in rows:
         if row["difficulty"] in baselines:
             residuals.setdefault(row["primary_tag"], []).append(
-                math.log2(max(row["duration"], _floor_min()) / baselines[row["difficulty"]])
+                math.log2(max(row["duration"], configured_floor(row["difficulty"]))
+                          / baselines[row["difficulty"]])
             )
     minimum = _config().get("min_samples_for_weakness", 5)
     return [

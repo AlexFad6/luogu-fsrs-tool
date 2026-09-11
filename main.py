@@ -67,7 +67,7 @@ def add(pid: str, title: str, difficulty: str | None, tags: str, score: float) -
                 "all_tags": [x.strip() for x in tags.split(",") if x.strip()],
             })
             connection.execute("UPDATE problems SET is_solved = 1 WHERE pid = ?", (pid,))
-            db.add_review(connection, pid, score)
+            db.add_review(connection, pid, score, is_initial=True)
             db.save_card_state(connection, pid, initial_state(score))
         console.print(f"[green]已添加 {pid}，下次复习已安排。[/green]")
     except Exception as exc:
@@ -229,8 +229,9 @@ def review(pid: str, score: float | None, automatic: bool, duration: int | None,
             raise click.UsageError("--auto 不能与 --score 同时使用")
         if score is None and not automatic:
             raise click.UsageError("请提供 --score，或使用 --auto")
+        problem = db.get_problem(connection, pid)
         current = {"duration": duration, "wrong_submissions": wrong_submissions,
-                   "saw_solution": saw_solution}
+                   "saw_solution": saw_solution, "difficulty": problem["difficulty"]}
         if automatic:
             rating, reason = infer_rating(history, current)
             console.print(f"自动推断：{rating.name}（{reason}）")
@@ -437,14 +438,14 @@ def _start_solving() -> None:
             connection.execute("UPDATE problems SET is_solved = 1 WHERE pid = ?", (pid,))
             if problem["title"] == pid and not problem["difficulty"]:
                 db.add_review(connection, pid, 0.5, duration=duration,
-                              wrong_submissions=wrong_submissions)
+                              wrong_submissions=wrong_submissions, is_initial=True)
                 db.save_card_state(connection, pid, initial_state(0.5))
                 rating_text = "Good（新题）"
             else:
                 card = connection.execute("SELECT * FROM card_states WHERE pid = ?", (pid,)).fetchone()
                 if card is None:
                     db.add_review(connection, pid, 0.5, duration=duration,
-                                  wrong_submissions=wrong_submissions)
+                                  wrong_submissions=wrong_submissions, is_initial=True)
                     db.save_card_state(connection, pid, initial_state(0.5))
                     rating_text = "Good（自动创建卡片）"
                 else:
@@ -452,7 +453,8 @@ def _start_solving() -> None:
                         "SELECT * FROM review_records WHERE pid = ? ORDER BY review_date, id", (pid,)
                     )]
                     rating, reason = infer_rating(
-                        history, {"duration": duration, "wrong_submissions": wrong_submissions}
+                        history, {"duration": duration, "wrong_submissions": wrong_submissions,
+                                  "difficulty": problem["difficulty"]}
                     )
                     db.add_review(connection, pid, {
                         Rating.Again: 0.0, Rating.Hard: 0.3,

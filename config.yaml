@@ -65,6 +65,16 @@ recommend:
 
 review_scoring:
   floor_min: 5
+  difficulty_floor_min:
+    入门: 2
+    普及−: 5
+    普及: 8
+    普及+/提高−: 12
+    提高: 15
+    提高+/省选−: 20
+    省选/NOI−: 30
+    NOI/NOI+/CTS: 45
+  adaptive_floor_ratio: 0.25
   imp_easy: 1.0
   imp_good: 0.0
   imp_hard: -1.0

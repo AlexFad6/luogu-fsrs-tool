@@ -98,13 +98,22 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_algorithm_tags ON problems(algorithm_tags)")
     review_columns = {row["name"] for row in connection.execute("PRAGMA table_info(review_records)")}
+    added_initial_column = "is_initial" not in review_columns
     for name, definition in (
         ("wrong_submissions", "INTEGER NOT NULL DEFAULT 0"),
         ("saw_solution", "INTEGER NOT NULL DEFAULT 0"),
         ("primary_tag", "TEXT"),
+        ("is_initial", "INTEGER NOT NULL DEFAULT 0"),
     ):
         if name not in review_columns:
             connection.execute(f"ALTER TABLE review_records ADD COLUMN {name} {definition}")
+    if added_initial_column:
+        connection.execute(
+            """UPDATE review_records SET is_initial = 1
+               WHERE id IN (
+                   SELECT MIN(id) FROM review_records GROUP BY pid
+               )"""
+        )
     manager = TagManager(connection)
     manager.initialize()
     for row in connection.execute("SELECT pid, all_tags, tags FROM problems"):
@@ -229,13 +238,15 @@ def get_problem_algorithm_tags(connection: sqlite3.Connection, pid: str) -> list
 
 def add_review(connection: sqlite3.Connection, pid: str, score: float,
                duration: int | None = None, note: str | None = None,
-               wrong_submissions: int = 0, saw_solution: bool = False) -> None:
+               wrong_submissions: int = 0, saw_solution: bool = False,
+               is_initial: bool = False) -> None:
     tag = primary_tag(connection, pid)
     connection.execute(
         """INSERT INTO review_records
-           (pid, score, duration, note, wrong_submissions, saw_solution, primary_tag)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (pid, score, duration, note, wrong_submissions, int(saw_solution), tag),
+           (pid, score, duration, note, wrong_submissions, saw_solution, primary_tag, is_initial)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (pid, score, duration, note, wrong_submissions, int(saw_solution), tag,
+         int(is_initial)),
     )
 
 
