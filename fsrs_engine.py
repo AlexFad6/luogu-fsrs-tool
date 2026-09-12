@@ -23,6 +23,7 @@ def state_from_card(card: Card, reps: int) -> dict:
         "due_date": as_iso(card.due),
         "last_review": as_iso(card.last_review),
         "reps": reps,
+        "retrievability": Scheduler().get_card_retrievability(card),
     }
 
 
@@ -46,3 +47,14 @@ def review_state_by_rating(existing: dict, rating: Rating) -> dict:
         card.state = State.Review
     updated = Scheduler().review_card(card, rating)[0]
     return state_from_card(updated, existing.get("reps", 0) + 1)
+
+
+def retrievability(existing: dict) -> float:
+    """Return current FSRS retrievability for a persisted card state."""
+    card = Card()
+    for key in ("stability", "difficulty", "due", "last_review"):
+        if key in existing and hasattr(card, key):
+            setattr(card, key, existing[key])
+    if existing.get("reps", 0) > 0:
+        card.state = State.Review
+    return Scheduler().get_card_retrievability(card)
