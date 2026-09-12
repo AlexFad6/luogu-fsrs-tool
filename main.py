@@ -11,14 +11,16 @@ from urllib.parse import urlparse
 import click
 import yaml
 from rich.console import Console
+from rich.table import Table
 
 import db
 from fsrs_engine import initial_state, review_state
 from fsrs_engine import review_state_by_rating
+from fsrs_engine import retrievability
 from recommender import new_recommendations, statistics
 from crawler import LuoguCrawler
 from tag_manager import TagManager
-from review_scoring import infer_rating
+from review_scoring import infer_rating, timing_metrics
 from tag_stats import weakness_stats
 from fsrs import Rating
 
@@ -67,8 +69,10 @@ def add(pid: str, title: str, difficulty: str | None, tags: str, score: float) -
                 "all_tags": [x.strip() for x in tags.split(",") if x.strip()],
             })
             connection.execute("UPDATE problems SET is_solved = 1 WHERE pid = ?", (pid,))
-            db.add_review(connection, pid, score, is_initial=True)
-            db.save_card_state(connection, pid, initial_state(score))
+            state = initial_state(score)
+            db.add_review(connection, pid, score, attempt_type="initial",
+                          retrievability=state["retrievability"])
+            db.save_card_state(connection, pid, state)
         console.print(f"[green]已添加 {pid}，下次复习已安排。[/green]")
     except Exception as exc:
         raise click.ClickException(f"保存失败：{exc}") from exc
@@ -222,16 +226,17 @@ def review(pid: str, score: float | None, automatic: bool, duration: int | None,
         existing = dict(row)
         existing["due"] = db.parse_datetime(existing.pop("due_date"))
         existing["last_review"] = db.parse_datetime(existing["last_review"])
-        history = [dict(item) for item in connection.execute(
-            "SELECT * FROM review_records WHERE pid = ? ORDER BY review_date, id", (pid,)
-        )]
+        history = db.get_attempts(connection, pid)
         if automatic and score is not None:
             raise click.UsageError("--auto 不能与 --score 同时使用")
         if score is None and not automatic:
             raise click.UsageError("请提供 --score，或使用 --auto")
         problem = db.get_problem(connection, pid)
         current = {"duration": duration, "wrong_submissions": wrong_submissions,
-                   "saw_solution": saw_solution, "difficulty": problem["difficulty"]}
+                   "saw_solution": saw_solution, "difficulty": problem["difficulty"],
+                   "due_date": existing["due"],
+                   "attempt_type": "initial" if not history else "review",
+                   "_pool_history": db.get_all_attempts_for_stats(connection)}
         if automatic:
             rating, reason = infer_rating(history, current)
             console.print(f"自动推断：{rating.name}（{reason}）")
@@ -243,10 +248,18 @@ def review(pid: str, score: float | None, automatic: bool, duration: int | None,
         else:
             rating = None
         with connection:
-            db.add_review(connection, pid, score, duration=duration,
+            attempt_type = current["attempt_type"]
+            if attempt_type == "initial":
+                db.add_review(connection, pid, score, duration=duration,
                           wrong_submissions=wrong_submissions,
-                          saw_solution=saw_solution)
-            state = review_state_by_rating(existing, rating) if rating else review_state(existing, score)
+                          saw_solution=saw_solution, attempt_type="initial")
+                state = initial_state(score)
+            else:
+                db.add_review(connection, pid, score, duration=duration,
+                          wrong_submissions=wrong_submissions,
+                          saw_solution=saw_solution, attempt_type="review",
+                          retrievability=retrievability(existing))
+                state = review_state_by_rating(existing, rating) if rating else review_state(existing, score)
             db.save_card_state(connection, pid, state)
         console.print(f"已完成 {pid}，下次复习：{state['due_date']}")
     finally:
@@ -296,6 +309,42 @@ def stats() -> None:
         for item in weakness_stats(connection):
             value = "数据不足" if item["weakness"] is None else f"{item['weakness']:.2f}"
             console.print(f"    {item['tag']}: {value}（样本 {item['samples']}）")
+        all_attempts = db.get_all_attempts_for_stats(connection)
+        console.print("  题目用时基线：")
+        baseline_rows = []
+        for problem in connection.execute("SELECT pid, title, difficulty FROM problems ORDER BY pid"):
+            history = [row for row in all_attempts if row["pid"] == problem["pid"]]
+            floor, baseline, count = timing_metrics(
+                history, {"difficulty": problem["difficulty"], "_pool_history": all_attempts}
+            )
+            card = connection.execute(
+                "SELECT * FROM card_states WHERE pid = ?", (problem["pid"],)
+            ).fetchone()
+            current_retrievability = None
+            if card is not None:
+                card_state = dict(card)
+                card_state["due"] = db.parse_datetime(card_state.pop("due_date"))
+                card_state["last_review"] = db.parse_datetime(card_state["last_review"])
+                current_retrievability = retrievability(card_state)
+            baseline_rows.append(
+                (current_retrievability if current_retrievability is not None else 1.0,
+                 problem, floor, baseline, count, current_retrievability)
+            )
+        baseline_rows.sort(key=lambda row: (row[0], row[1]["pid"]))
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("题号")
+        table.add_column("题目")
+        table.add_column("Floor", justify="right")
+        table.add_column("Baseline", justify="right")
+        table.add_column("尝试次数", justify="right")
+        table.add_column("可提取度 R", justify="right")
+        for _, problem, floor, baseline, count, current_retrievability in baseline_rows:
+            table.add_row(
+                problem["pid"], problem["title"], f"{floor:.2f}", f"{baseline:.2f}",
+                str(count), "-" if current_retrievability is None
+                else f"{current_retrievability:.2f}",
+            )
+        console.print(table)
         console.print(f"  连续打卡: {result['streak']} 天")
     finally:
         connection.close()
@@ -437,34 +486,57 @@ def _start_solving() -> None:
                 raise click.ClickException(f"无法保存题目 {pid}")
             connection.execute("UPDATE problems SET is_solved = 1 WHERE pid = ?", (pid,))
             if problem["title"] == pid and not problem["difficulty"]:
+                state = initial_state(0.5)
                 db.add_review(connection, pid, 0.5, duration=duration,
-                              wrong_submissions=wrong_submissions, is_initial=True)
-                db.save_card_state(connection, pid, initial_state(0.5))
+                              wrong_submissions=wrong_submissions, attempt_type="initial",
+                              retrievability=state["retrievability"])
+                db.save_card_state(connection, pid, state)
                 rating_text = "Good（新题）"
             else:
                 card = connection.execute("SELECT * FROM card_states WHERE pid = ?", (pid,)).fetchone()
                 if card is None:
+                    state = initial_state(0.5)
                     db.add_review(connection, pid, 0.5, duration=duration,
-                                  wrong_submissions=wrong_submissions, is_initial=True)
-                    db.save_card_state(connection, pid, initial_state(0.5))
+                                  wrong_submissions=wrong_submissions, attempt_type="initial",
+                                  retrievability=state["retrievability"])
+                    db.save_card_state(connection, pid, state)
                     rating_text = "Good（自动创建卡片）"
                 else:
-                    history = [dict(row) for row in connection.execute(
-                        "SELECT * FROM review_records WHERE pid = ? ORDER BY review_date, id", (pid,)
-                    )]
+                    history = db.get_attempts(connection, pid)
+                    card_state = dict(card)
+                    card_state["due"] = db.parse_datetime(card_state.pop("due_date"))
+                    card_state["last_review"] = db.parse_datetime(card_state["last_review"])
+                    current_retrievability = retrievability(card_state)
                     rating, reason = infer_rating(
                         history, {"duration": duration, "wrong_submissions": wrong_submissions,
-                                  "difficulty": problem["difficulty"]}
+                         "difficulty": problem["difficulty"],
+                         "due_date": card_state["due"],
+                         "retrievability": current_retrievability,
+                         "attempt_type": "review",
+                         "_pool_history": db.get_all_attempts_for_stats(connection)}
                     )
                     db.add_review(connection, pid, {
                         Rating.Again: 0.0, Rating.Hard: 0.3,
                         Rating.Good: 0.5, Rating.Easy: 0.8,
-                    }[rating], duration=duration, wrong_submissions=wrong_submissions)
-                    state = dict(card)
-                    state["due"] = db.parse_datetime(state.pop("due_date"))
-                    state["last_review"] = db.parse_datetime(state["last_review"])
+                    }[rating], duration=duration, wrong_submissions=wrong_submissions,
+                                  attempt_type="review",
+                                  retrievability=current_retrievability)
+                    state = card_state
                     db.save_card_state(connection, pid, review_state_by_rating(state, rating))
-                    rating_text = f"{rating.name}（{reason}）"
+                    previous_reviews = [
+                        row for row in history
+                        if row.get("attempt_type", "review") == "review"
+                        and row.get("duration") is not None
+                    ]
+                    previous_duration = (
+                        previous_reviews[-1]["duration"] if previous_reviews else duration
+                    )
+                    improvement_match = re.search(r"imp=([-+]?\d+(?:\.\d+)?)", reason)
+                    improvement_text = improvement_match.group(1) if improvement_match else "0.00"
+                    rating_text = (
+                        f"{rating.name}（用时 {previous_duration:g}->{duration:g} 分钟，"
+                        f"imp={improvement_text} -> {rating.name}）"
+                    )
     finally:
         connection.close()
     console.print(f"AC，已记录用时 {duration} 分钟，评分：{rating_text}。")

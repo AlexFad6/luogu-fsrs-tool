@@ -54,7 +54,9 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             note TEXT,
             wrong_submissions INTEGER NOT NULL DEFAULT 0,
             saw_solution INTEGER NOT NULL DEFAULT 0,
-            primary_tag TEXT
+            primary_tag TEXT,
+            attempt_type TEXT NOT NULL DEFAULT 'review',
+            retrievability REAL
         );
         CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,22 +100,44 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_algorithm_tags ON problems(algorithm_tags)")
     review_columns = {row["name"] for row in connection.execute("PRAGMA table_info(review_records)")}
-    added_initial_column = "is_initial" not in review_columns
     for name, definition in (
         ("wrong_submissions", "INTEGER NOT NULL DEFAULT 0"),
         ("saw_solution", "INTEGER NOT NULL DEFAULT 0"),
         ("primary_tag", "TEXT"),
-        ("is_initial", "INTEGER NOT NULL DEFAULT 0"),
+        ("attempt_type", "TEXT NOT NULL DEFAULT 'review'"),
+        ("retrievability", "REAL"),
     ):
         if name not in review_columns:
             connection.execute(f"ALTER TABLE review_records ADD COLUMN {name} {definition}")
-    if added_initial_column:
+    if "is_initial" in review_columns:
         connection.execute(
-            """UPDATE review_records SET is_initial = 1
-               WHERE id IN (
-                   SELECT MIN(id) FROM review_records GROUP BY pid
-               )"""
+            """UPDATE review_records
+               SET attempt_type = CASE WHEN is_initial = 1 THEN 'initial' ELSE 'review' END
+               WHERE attempt_type IS NULL OR attempt_type = 'review'"""
         )
+        # SQLite cannot drop a column in older supported versions. Rebuild the
+        # table so new databases no longer expose the legacy flag.
+        connection.execute("DROP INDEX IF EXISTS idx_review_pid")
+        connection.execute("ALTER TABLE review_records RENAME TO review_records_legacy")
+        connection.execute(
+            """CREATE TABLE review_records (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, pid TEXT NOT NULL REFERENCES problems(pid),
+               review_date TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               score REAL NOT NULL CHECK(score >= 0 AND score <= 1), duration INTEGER,
+               note TEXT, wrong_submissions INTEGER NOT NULL DEFAULT 0,
+               saw_solution INTEGER NOT NULL DEFAULT 0, primary_tag TEXT,
+               attempt_type TEXT NOT NULL DEFAULT 'review', retrievability REAL)"""
+        )
+        connection.execute(
+            """INSERT INTO review_records
+               (id,pid,review_date,score,duration,note,wrong_submissions,saw_solution,
+                primary_tag,attempt_type,retrievability)
+               SELECT id,pid,review_date,score,duration,note,wrong_submissions,saw_solution,
+                      primary_tag,attempt_type,retrievability
+               FROM review_records_legacy"""
+        )
+        connection.execute("DROP TABLE review_records_legacy")
+        connection.execute("CREATE INDEX idx_review_pid ON review_records(pid)")
     manager = TagManager(connection)
     manager.initialize()
     for row in connection.execute("SELECT pid, all_tags, tags FROM problems"):
@@ -239,15 +263,61 @@ def get_problem_algorithm_tags(connection: sqlite3.Connection, pid: str) -> list
 def add_review(connection: sqlite3.Connection, pid: str, score: float,
                duration: int | None = None, note: str | None = None,
                wrong_submissions: int = 0, saw_solution: bool = False,
-               is_initial: bool = False) -> None:
+               is_initial: bool = False, attempt_type: str | None = None,
+               retrievability: float | None = None) -> None:
+    """Persist an attempt.
+
+    ``is_initial`` remains as a source-compatible alias for older callers and
+    databases; new code should use ``attempt_type`` explicitly.
+    """
+    attempt_type = attempt_type or ("initial" if is_initial else "review")
+    if attempt_type not in {"initial", "review", "practice"}:
+        raise ValueError(f"unsupported attempt_type: {attempt_type}")
     tag = primary_tag(connection, pid)
     connection.execute(
         """INSERT INTO review_records
-           (pid, score, duration, note, wrong_submissions, saw_solution, primary_tag, is_initial)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+           (pid, score, duration, note, wrong_submissions, saw_solution, primary_tag,
+            attempt_type, retrievability)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (pid, score, duration, note, wrong_submissions, int(saw_solution), tag,
-         int(is_initial)),
+         attempt_type, retrievability),
     )
+
+
+def _normalize_attempt(row: sqlite3.Row | dict) -> dict:
+    """Normalize current and pre-migration rows to one public shape."""
+    result = dict(row)
+    if not result.get("attempt_type"):
+        result["attempt_type"] = "initial" if result.get("is_initial") else "review"
+    result["is_initial"] = result["attempt_type"] == "initial"
+    return result
+
+
+def get_attempts(connection: sqlite3.Connection, pid: str,
+                 attempt_type: str | None = None) -> list[dict]:
+    """Return attempts for a problem, optionally filtered by event type."""
+    if attempt_type is not None and attempt_type not in {"initial", "review", "practice"}:
+        raise ValueError(f"unsupported attempt_type: {attempt_type}")
+    query = "SELECT * FROM review_records WHERE pid = ?"
+    params: tuple[object, ...] = (pid,)
+    if attempt_type is not None:
+        query += " AND attempt_type = ?"
+        params += (attempt_type,)
+    query += " ORDER BY review_date, id"
+    rows = connection.execute(
+        query, params
+    ).fetchall()
+    return [_normalize_attempt(row) for row in rows]
+
+
+def get_all_attempts_for_stats(connection: sqlite3.Connection) -> list[dict]:
+    """Return attempts with problem metadata for statistics and scoring baselines."""
+    rows = connection.execute(
+        """SELECT r.*, p.difficulty, p.algorithm_tags FROM review_records r
+           JOIN problems p ON p.pid = r.pid
+           ORDER BY r.review_date, r.id"""
+    ).fetchall()
+    return [_normalize_attempt(row) for row in rows]
 
 
 def primary_tag(connection: sqlite3.Connection, pid: str) -> str | None:
