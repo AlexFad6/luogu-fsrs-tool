@@ -5,7 +5,10 @@ from __future__ import annotations
 import math
 import sqlite3
 from statistics import median
-from review_scoring import configured_floor
+from pathlib import Path
+import yaml
+import db
+from review_scoring import global_floor, pool_baseline
 
 
 def _config() -> dict:
@@ -14,22 +17,17 @@ def _config() -> dict:
 
 
 def weakness_stats(connection: sqlite3.Connection) -> list[dict]:
-    rows = connection.execute(
-        """SELECT r.primary_tag, p.difficulty, r.duration
-           FROM review_records r JOIN problems p ON p.pid = r.pid
-           WHERE r.primary_tag IS NOT NULL AND r.duration IS NOT NULL"""
-    ).fetchall()
-    by_difficulty: dict[str, list[float]] = {}
-    for row in rows:
-        floor = configured_floor(row["difficulty"])
-        by_difficulty.setdefault(row["difficulty"], []).append(max(row["duration"], floor))
-    baselines = {key: median(values) for key, values in by_difficulty.items() if len(values) >= 3}
+    rows = [row for row in db.get_all_attempts_for_stats(connection)
+            if row.get("primary_tag") is not None and row.get("duration") is not None]
+    all_rows = db.get_all_attempts_for_stats(connection)
+    baselines = {}
+    for difficulty in {row.get("difficulty") for row in all_rows}:
+        baselines[difficulty] = pool_baseline(all_rows, difficulty)
     residuals: dict[str, list[float]] = {}
     for row in rows:
         if row["difficulty"] in baselines:
             residuals.setdefault(row["primary_tag"], []).append(
-                math.log2(max(row["duration"], configured_floor(row["difficulty"]))
-                          / baselines[row["difficulty"]])
+                math.log2(float(row["duration"]) / baselines[row["difficulty"]])
             )
     minimum = _config().get("min_samples_for_weakness", 5)
     return [

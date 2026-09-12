@@ -66,17 +66,38 @@ recommend:
 review_scoring:
   floor_min: 5
   difficulty_floor_min:
-    入门: 2
-    普及−: 5
-    普及: 8
-    普及+/提高−: 12
-    提高: 15
-    提高+/省选−: 20
-    省选/NOI−: 30
-    NOI/NOI+/CTS: 45
-  adaptive_floor_ratio: 0.25
+    initial:
+      入门: 2
+      普及−: 5
+      普及: 8
+      普及+/提高−: 15
+      提高: 30
+      提高+/省选−: 60
+      省选/NOI−: 90
+      NOI/NOI+/CTS: 150
+    review:
+      入门: 1
+      普及−: 3
+      普及: 5
+      普及+/提高−: 10
+      提高: 15
+      提高+/省选−: 30
+      省选/NOI−: 45
+      NOI/NOI+/CTS: 60
+  adaptive_floor_ratio:
+    initial: 0.25
+    review: 0.25
   imp_easy: 1.0
   imp_good: 0.0
   imp_hard: -1.0
   wrong_hard: 2
   wrong_again_margin: 1
+  ewma_alpha: 0.35
+  ewma_half_life: 2
+  pool_min_problems: 3
+  excess_epsilon: 0.5
+  excess_easy: 1.0
+  excess_good: 0.0
+  excess_hard: -1.0
+  freshness_again: 0.2
+  freshness_cap: true
