@@ -5,7 +5,9 @@ from __future__ import annotations
 import math
 import sqlite3
 from statistics import median
-from review_scoring import configured_floor
+from pathlib import Path
+
+import yaml
 
 
 def _config() -> dict:
