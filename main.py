@@ -468,11 +468,11 @@ def _start_solving() -> None:
     started = time.monotonic()
     wrong_submissions = 0
     while True:
-        result = click.prompt("本次结果")
-        if result == "0":
+        result = click.prompt("本次结果", type=click.IntRange(0, 2))
+        if result == 0:
             console.print("已退出，本次做题记录未保存。")
             return
-        if result == "1":
+        if result == 1:
             break
         wrong_submissions += 1
         console.print(f"已记录 WA（累计 {wrong_submissions} 次）。")
