@@ -568,7 +568,7 @@ def _delete_question_records() -> None:
                 record["attempt_type"],
             )
         console.print(table)
-        pid = validate_pid(click.prompt("请输入要删除记录的题号"))
+        pid = validate_pid(click.prompt("请输入要删除记录的题号").rstrip())
         count = sum(record["pid"] == pid for record in records)
         if not count:
             console.print(f"未找到题目 {pid} 的做题记录，未执行删除。")
