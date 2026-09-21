@@ -320,6 +320,26 @@ def get_all_attempts_for_stats(connection: sqlite3.Connection) -> list[dict]:
     return [_normalize_attempt(row) for row in rows]
 
 
+def get_all_attempts_for_display(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return all attempts with the problem title for the interactive list."""
+    return list(connection.execute(
+        """SELECT r.id, r.pid, p.title, r.review_date, r.score, r.duration,
+                  r.wrong_submissions, r.attempt_type
+           FROM review_records r
+           JOIN problems p ON p.pid = r.pid
+           ORDER BY r.review_date, r.id"""
+    ))
+
+
+def delete_attempts(connection: sqlite3.Connection, pid: str) -> int:
+    """Delete all attempts for a problem and reset its derived study state."""
+    cursor = connection.execute("DELETE FROM review_records WHERE pid = ?", (pid,))
+    if cursor.rowcount:
+        connection.execute("DELETE FROM card_states WHERE pid = ?", (pid,))
+        connection.execute("UPDATE problems SET is_solved = 0 WHERE pid = ?", (pid,))
+    return cursor.rowcount
+
+
 def primary_tag(connection: sqlite3.Connection, pid: str) -> str | None:
     rows = connection.execute(
         """SELECT t.name, COUNT(r.id) AS practice_count

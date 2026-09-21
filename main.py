@@ -542,10 +542,52 @@ def _start_solving() -> None:
     console.print(f"AC，已记录用时 {duration} 分钟，评分：{rating_text}。")
 
 
+def _delete_question_records() -> None:
+    """Display all attempts and optionally delete every attempt for one problem."""
+    connection = setup()
+    try:
+        records = db.get_all_attempts_for_display(connection)
+        console.print("\n做题记录：")
+        if not records:
+            console.print("  当前没有做题记录。")
+            return
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("题号")
+        table.add_column("题目")
+        table.add_column("日期")
+        table.add_column("评分", justify="right")
+        table.add_column("用时（分钟）", justify="right")
+        table.add_column("类型")
+        for record in records:
+            table.add_row(
+                record["pid"],
+                record["title"],
+                record["review_date"],
+                f"{record['score']:.2f}",
+                "-" if record["duration"] is None else str(record["duration"]),
+                record["attempt_type"],
+            )
+        console.print(table)
+        pid = validate_pid(click.prompt("请输入要删除记录的题号"))
+        count = sum(record["pid"] == pid for record in records)
+        if not count:
+            console.print(f"未找到题目 {pid} 的做题记录，未执行删除。")
+            return
+        if click.prompt(f"确认删除题目 {pid} 的 {count} 条做题记录？请输入 y 确认",
+                        default="", show_default=False).strip().lower() != "y":
+            console.print("用户已取消操作。")
+            return
+        with connection:
+            db.delete_attempts(connection, pid)
+        console.print(f"已删除题目 {pid} 的 {count} 条做题记录。")
+    finally:
+        connection.close()
+
+
 def interactive_menu() -> None:
     """Run the numbered interactive interface used when no command is supplied."""
     options = ["开始做题", "每日推荐", "导入洛谷题目",
-               "学习统计", "查看题目详情", "浏览标签库"]
+               "学习统计", "查看题目详情", "浏览标签库", "删除做题记录"]
     while True:
         choice = _menu_choice("洛谷 FSRS 复习工具", options)
         try:
@@ -566,6 +608,8 @@ def interactive_menu() -> None:
                 if category:
                     subcategory = click.prompt("二级分类（留空查看该一级分类）", default="")
                 browse_tags.callback(category or None, subcategory or None)
+            elif choice == 6:
+                _delete_question_records()
             elif choice == -1:
                 return
         except (click.ClickException, click.BadParameter) as exc:

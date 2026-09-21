@@ -27,6 +27,25 @@ def test_attempt_type_and_retrievability_are_persisted():
     assert len(db.get_all_attempts_for_stats(connection)) == 2
 
 
+def test_delete_attempts_removes_records_and_derived_state():
+    connection = setup_connection()
+    db.add_review(connection, "P1001", 0.5, attempt_type="initial")
+    db.save_card_state(connection, "P1001", {
+        "stability": 1.0, "difficulty": 5.0, "due_date": None,
+        "last_review": None, "reps": 1,
+    })
+    connection.execute("UPDATE problems SET is_solved = 1 WHERE pid = 'P1001'")
+
+    assert db.delete_attempts(connection, "P1001") == 1
+    assert db.get_attempts(connection, "P1001") == []
+    assert connection.execute(
+        "SELECT * FROM card_states WHERE pid = 'P1001'"
+    ).fetchone() is None
+    assert connection.execute(
+        "SELECT is_solved FROM problems WHERE pid = 'P1001'"
+    ).fetchone()["is_solved"] == 0
+
+
 def test_solution_and_errors_have_priority_over_timing():
     assert infer_rating([], {"saw_solution": True})[0] == Rating.Again
     history = [{"attempt_type": "review", "duration": 1, "wrong_submissions": 0}]
