@@ -432,8 +432,8 @@ def _import_luogu_problem() -> None:
     fetch.callback((pid,), 1.0, force)
 
 
-def _start_solving() -> None:
-    """Run a timed solving session and save it when the user reports AC."""
+def _start_solving() -> bool:
+    """Run one timed solving session and return whether it was completed."""
     connection = setup()
     try:
         due = db.due_problems(connection)[:5]
@@ -471,7 +471,7 @@ def _start_solving() -> None:
         result = click.prompt("本次结果", type=click.IntRange(0, 2))
         if result == 0:
             console.print("已退出，本次做题记录未保存。")
-            return
+            return False
         if result == 1:
             break
         wrong_submissions += 1
@@ -540,6 +540,7 @@ def _start_solving() -> None:
     finally:
         connection.close()
     console.print(f"AC，已记录用时 {duration} 分钟，评分：{rating_text}。")
+    return True
 
 
 def _delete_question_records() -> None:
@@ -592,7 +593,8 @@ def interactive_menu() -> None:
         choice = _menu_choice("洛谷 FSRS 复习工具", options)
         try:
             if choice == 0:
-                _start_solving()
+                while _start_solving():
+                    pass
             elif choice == 1:
                 recommend.callback(5)
             elif choice == 2:
